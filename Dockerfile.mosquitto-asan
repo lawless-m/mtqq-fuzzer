@@ -1,0 +1,80 @@
+# Dockerfile.mosquitto-asan
+# Build Mosquitto with AddressSanitizer for vulnerability detection
+#
+# Usage:
+#   docker build -f Dockerfile.mosquitto-asan -t mosquitto-asan .
+#   docker run -it --rm -p 1883:1883 mosquitto-asan
+#
+# ASAN will report any memory errors (use-after-free, buffer overflow, etc.)
+# with full stack traces.
+
+FROM debian:bookworm-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    cmake \
+    libssl-dev \
+    libcjson-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build Mosquitto with ASAN
+ARG MOSQUITTO_VERSION=v2.0.18
+RUN git clone --depth 1 --branch ${MOSQUITTO_VERSION} \
+    https://github.com/eclipse/mosquitto.git /mosquitto
+
+WORKDIR /mosquitto/build
+
+# Build with AddressSanitizer and debug symbols
+# Disable TLS and CJSON to reduce attack surface and simplify build
+RUN cmake .. \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
+    -DWITH_TLS=OFF \
+    -DWITH_CJSON=OFF \
+    -DWITH_CLIENTS=OFF \
+    -DWITH_APPS=OFF \
+    -DWITH_PLUGINS=OFF \
+    -DDOCUMENTATION=OFF \
+    && make -j$(nproc)
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies for ASAN
+RUN apt-get update && apt-get install -y \
+    libasan8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binary
+COPY --from=builder /mosquitto/build/src/mosquitto /usr/local/bin/
+COPY --from=builder /mosquitto/build/lib/libmosquitto.so* /usr/local/lib/
+
+# Update library cache
+RUN ldconfig
+
+# Create mosquitto user
+RUN useradd -r -s /bin/false mosquitto
+
+# Create directories
+RUN mkdir -p /var/lib/mosquitto /var/log/mosquitto \
+    && chown mosquitto:mosquitto /var/lib/mosquitto /var/log/mosquitto
+
+# Minimal config for fuzzing (no auth, allow anonymous)
+RUN echo 'listener 1883 0.0.0.0\n\
+allow_anonymous true\n\
+log_type all\n\
+connection_messages true\n\
+log_timestamp true' > /etc/mosquitto.conf
+
+EXPOSE 1883
+
+# ASAN options for better output
+ENV ASAN_OPTIONS="detect_leaks=1:abort_on_error=0:print_stats=1:halt_on_error=0"
+
+# Run as root for ASAN (it needs access to /proc/self/maps)
+# In production you'd never do this, but for fuzzing it's fine
+CMD ["mosquitto", "-c", "/etc/mosquitto.conf", "-v"]
