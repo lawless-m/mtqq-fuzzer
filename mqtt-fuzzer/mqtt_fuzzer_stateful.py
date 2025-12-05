@@ -10,22 +10,21 @@ This version properly handles the MQTT connection lifecycle:
 
 This finds bugs that only manifest in authenticated/connected state.
 
-Author: Built with boofuzz
-License: MIT
+Protocol reference: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
 """
 
 from boofuzz import (
     Session,
     Target,
     TCPSocketConnection,
-    s_initialize,
-    s_block,
-    s_byte,
-    s_bytes,
-    s_word,
-    s_string,
-    s_static,
-    s_get,
+    Request,
+    Block,
+    Byte,
+    Bytes,
+    Word,
+    String,
+    Static,
+    BIG_ENDIAN,
 )
 import struct
 import socket
@@ -34,40 +33,61 @@ import sys
 import time
 
 
+# =============================================================================
+# MQTT 3.1.1 Constants (per OASIS specification)
+# =============================================================================
+
+MQTT_PORT = 1883
+
+MQTT_CONNECT     = 0x10
+MQTT_PUBLISH     = 0x30
+MQTT_SUBSCRIBE   = 0x82
+MQTT_UNSUBSCRIBE = 0xA2
+MQTT_PINGREQ     = 0xC0
+MQTT_PUBREL      = 0x62
+
+MQTT_PROTOCOL_NAME = b"MQTT"
+MQTT_PROTOCOL_LEVEL = 0x04
+
+
+# =============================================================================
+# MQTT Connection State Manager
+# =============================================================================
+
 class MQTTConnection:
     """
     Helper class to manage MQTT connection state.
     Handles the CONNECT/CONNACK handshake before fuzzing.
     """
-    
+
     def __init__(self, host, port, client_id="boofuzz"):
         self.host = host
         self.port = port
         self.client_id = client_id
         self.sock = None
         self.connected = False
-    
+
     def build_connect_packet(self):
-        """Build a valid CONNECT packet."""
+        """Build a valid CONNECT packet per MQTT 3.1.1 Section 3.1."""
         # Variable header
         var_header = b""
-        var_header += struct.pack(">H", 4) + b"MQTT"  # Protocol name
-        var_header += bytes([0x04])  # Protocol level (3.1.1)
-        var_header += bytes([0x02])  # Connect flags (Clean Session)
-        var_header += struct.pack(">H", 60)  # Keep alive
-        
+        var_header += struct.pack(">H", 4) + MQTT_PROTOCOL_NAME
+        var_header += bytes([MQTT_PROTOCOL_LEVEL])
+        var_header += bytes([0x02])  # Clean Session
+        var_header += struct.pack(">H", 60)
+
         # Payload
         payload = struct.pack(">H", len(self.client_id)) + self.client_id.encode()
-        
+
         # Remaining length
         remaining = len(var_header) + len(payload)
         remaining_bytes = self._encode_remaining_length(remaining)
-        
+
         # Fixed header
-        fixed_header = bytes([0x10]) + remaining_bytes
-        
+        fixed_header = bytes([MQTT_CONNECT]) + remaining_bytes
+
         return fixed_header + var_header + payload
-    
+
     def _encode_remaining_length(self, length):
         """Encode remaining length per MQTT spec."""
         encoded = bytearray()
@@ -80,18 +100,18 @@ class MQTTConnection:
             if length == 0:
                 break
         return bytes(encoded)
-    
+
     def connect(self):
         """Establish MQTT connection."""
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
-            
+
             # Send CONNECT
             connect_packet = self.build_connect_packet()
             self.sock.sendall(connect_packet)
-            
+
             # Wait for CONNACK
             response = self.sock.recv(4)
             if len(response) >= 4:
@@ -103,18 +123,17 @@ class MQTTConnection:
                         return True
                     else:
                         print(f"[!] CONNACK return code: {return_code}")
-            
+
             return False
-            
+
         except Exception as e:
             print(f"[!] Connection error: {e}")
             return False
-    
+
     def disconnect(self):
         """Send DISCONNECT and close socket."""
         if self.sock:
             try:
-                # Send DISCONNECT packet
                 self.sock.sendall(bytes([0xE0, 0x00]))
             except:
                 pass
@@ -124,11 +143,15 @@ class MQTTConnection:
                 pass
         self.sock = None
         self.connected = False
-    
+
     def get_socket(self):
         """Return the connected socket for boofuzz to use."""
         return self.sock
 
+
+# =============================================================================
+# Callbacks for Stateful Protocols
+# =============================================================================
 
 def pre_send_connect(target, fuzz_data_logger, session, sock):
     """
@@ -143,7 +166,7 @@ def pre_send_connect(target, fuzz_data_logger, session, sock):
             client_id=f"fuzz_{int(time.time())}"
         )
         session._mqtt_connection = mqtt
-    
+
     if not mqtt.connected:
         if mqtt.connect():
             fuzz_data_logger.log_info("MQTT connection established")
@@ -159,263 +182,280 @@ def post_test_case_callback(target, fuzz_data_logger, session, sock):
     mqtt = getattr(session, '_mqtt_connection', None)
     if mqtt and mqtt.sock:
         try:
-            # Send PINGREQ to check if connection is alive
             mqtt.sock.settimeout(1.0)
-            mqtt.sock.sendall(bytes([0xC0, 0x00]))
+            mqtt.sock.sendall(bytes([MQTT_PINGREQ, 0x00]))
             response = mqtt.sock.recv(2)
             if len(response) == 2 and response[0] == 0xD0:
-                # Got PINGRESP, connection is alive
                 return
         except:
             pass
-        
-        # Connection seems dead, reconnect
+
         fuzz_data_logger.log_info("Connection lost, reconnecting...")
         mqtt.disconnect()
         mqtt.connected = False
 
 
 # =============================================================================
-# Protocol Definitions for Connected State
+# Protocol Definitions for Connected State (Object-Oriented Style)
 # =============================================================================
 
-def define_publish_connected(session):
-    """PUBLISH after connection established."""
-    s_initialize("pub_connected")
-    
-    # PUBLISH QoS 0
-    s_byte(0x30, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x000A, name="topic_len", endian=">", fuzzable=True)
-        s_string("fuzz/topic", name="topic", fuzzable=True, max_len=65535)
-    
-    with s_block("payload"):
-        s_string("fuzz_message", name="message", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("pub_connected"))
+def define_mqtt_publish_connected():
+    """MQTT-PUBLISH-Connected: Publish after connection established."""
+    return Request("MQTT-PUBLISH-Connected", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBLISH, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="fuzz/topic", fuzzable=True, max_len=65535),
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="fuzz_message", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_subscribe_connected(session):
-    """SUBSCRIBE after connection established."""
-    s_initialize("sub_connected")
-    
-    s_byte(0x82, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_word(0x000A, name="topic_len", endian=">", fuzzable=True)
-        s_string("fuzz/topic", name="topic", fuzzable=True, max_len=65535)
-        s_byte(0x00, name="qos", fuzzable=True)
-    
-    session.connect(s_get("sub_connected"))
+def define_mqtt_subscribe_connected():
+    """MQTT-SUBSCRIBE-Connected: Subscribe after connection established."""
+    return Request("MQTT-SUBSCRIBE-Connected", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_SUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_filter", default_value="fuzz/topic", fuzzable=True, max_len=65535),
+            Byte(name="requested_qos", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_unsubscribe_connected(session):
-    """UNSUBSCRIBE after connection established."""
-    s_initialize("unsub_connected")
-    
-    s_byte(0xA2, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_word(0x000A, name="topic_len", endian=">", fuzzable=True)
-        s_string("fuzz/topic", name="topic", fuzzable=True)
-    
-    session.connect(s_get("unsub_connected"))
+def define_mqtt_unsubscribe_connected():
+    """MQTT-UNSUBSCRIBE-Connected: Unsubscribe after connection established."""
+    return Request("MQTT-UNSUBSCRIBE-Connected", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_UNSUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_filter", default_value="fuzz/topic", fuzzable=True),
+        )),
+    ))
 
 
-def define_qos1_publish_connected(session):
-    """PUBLISH QoS 1 that expects PUBACK."""
-    s_initialize("pub_qos1_connected")
-    
-    # PUBLISH + QoS 1
-    s_byte(0x32, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0007, name="topic_len", endian=">", fuzzable=True)
-        s_string("qos1/t", name="topic", fuzzable=True)
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_string("qos1_msg", name="message", fuzzable=True)
-    
-    session.connect(s_get("pub_qos1_connected"))
+def define_mqtt_publish_qos1_connected():
+    """MQTT-PUBLISH-QoS1-Connected: QoS 1 publish expecting PUBACK."""
+    return Request("MQTT-PUBLISH-QoS1-Connected", children=(
+        Block("Fixed-Header", children=(
+            # PUBLISH + QoS 1
+            Byte(name="packet_type", default_value=0x32, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x0006, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="qos1/t", fuzzable=True),
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="qos1_msg", fuzzable=True),
+        )),
+    ))
 
 
-def define_qos2_publish_connected(session):
-    """PUBLISH QoS 2 that starts the 4-way handshake."""
-    s_initialize("pub_qos2_connected")
-    
-    # PUBLISH + QoS 2
-    s_byte(0x34, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0007, name="topic_len", endian=">", fuzzable=True)
-        s_string("qos2/t", name="topic", fuzzable=True)
-        s_word(0x0002, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_string("qos2_msg", name="message", fuzzable=True)
-    
-    session.connect(s_get("pub_qos2_connected"))
+def define_mqtt_publish_qos2_connected():
+    """MQTT-PUBLISH-QoS2-Connected: QoS 2 publish starting 4-way handshake."""
+    return Request("MQTT-PUBLISH-QoS2-Connected", children=(
+        Block("Fixed-Header", children=(
+            # PUBLISH + QoS 2
+            Byte(name="packet_type", default_value=0x34, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x0006, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="qos2/t", fuzzable=True),
+            Word(name="packet_identifier", default_value=0x0002, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="qos2_msg", fuzzable=True),
+        )),
+    ))
 
 
-def define_pubrel_connected(session):
-    """PUBREL sent without prior PUBREC (protocol violation)."""
-    s_initialize("pubrel_connected")
-    
-    s_byte(0x62, name="packet_type", fuzzable=True)
-    s_byte(0x02, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0xFFFF, name="packet_id", endian=">", fuzzable=True)
-    
-    session.connect(s_get("pubrel_connected"))
+def define_mqtt_pubrel_connected():
+    """MQTT-PUBREL-Connected: PUBREL without prior PUBREC (protocol violation)."""
+    return Request("MQTT-PUBREL-Connected", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBREL, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x02, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0xFFFF, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
-def define_pingreq_connected(session):
-    """PINGREQ in connected state."""
-    s_initialize("ping_connected")
-    
-    s_byte(0xC0, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    # Extra bytes that shouldn't be there
-    s_bytes(b"", name="extra", fuzzable=True, max_len=100)
-    
-    session.connect(s_get("ping_connected"))
+def define_mqtt_pingreq_connected():
+    """MQTT-PINGREQ-Connected: Ping with extra bytes (malformed)."""
+    return Request("MQTT-PINGREQ-Connected", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PINGREQ, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Extra-Bytes", children=(
+            Bytes(name="extra_data", default_value=b"", fuzzable=True, max_len=100),
+        )),
+    ))
 
 
-def define_second_connect(session):
-    """Second CONNECT on same connection (protocol violation)."""
-    s_initialize("second_connect")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    s_byte(0x10, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        s_static(b"MQTT", name="protocol_name")
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        s_byte(0x02, name="connect_flags", fuzzable=True)
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_word(0x0006, name="client_id_len", endian=">", fuzzable=True)
-        s_string("second", name="client_id", fuzzable=True)
-    
-    session.connect(s_get("second_connect"))
+def define_mqtt_second_connect():
+    """MQTT-Second-CONNECT: Protocol violation - CONNECT on existing connection."""
+    return Request("MQTT-Second-CONNECT", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x10, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            Static(name="protocol_name", default_value=MQTT_PROTOCOL_NAME),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            Byte(name="connect_flags", default_value=0x02, fuzzable=True),
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="client_id_length", default_value=0x0006, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="client_id", default_value="second", fuzzable=True),
+        )),
+    ))
 
 
-def define_massive_topic(session):
-    """PUBLISH with very long topic name."""
-    s_initialize("massive_topic")
-    
-    s_byte(0x30, name="packet_type", fuzzable=True)
-    
-    # Use multi-byte remaining length
-    s_bytes(b"\x80\x80\x01", name="remaining_len", fuzzable=True, max_len=4)
-    
-    with s_block("variable_header"):
-        s_word(0x4000, name="topic_len", endian=">", fuzzable=True)
-        s_bytes(b"A" * 0x4000, name="topic", fuzzable=True, max_len=0x10000)
-    
-    session.connect(s_get("massive_topic"))
+def define_mqtt_massive_topic():
+    """MQTT-Massive-Topic: Publish with very long topic name."""
+    return Request("MQTT-Massive-Topic", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBLISH, fuzzable=True),
+            # Multi-byte remaining length
+            Bytes(name="remaining_length", default_value=b"\x80\x80\x01", fuzzable=True, max_len=4),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x4000, endian=BIG_ENDIAN, fuzzable=True),
+            Bytes(name="topic_name", default_value=b"A" * 0x4000, fuzzable=True, max_len=0x10000),
+        )),
+    ))
 
 
-def define_subscribe_wildcards(session):
-    """SUBSCRIBE with various wildcard patterns."""
-    s_initialize("sub_wildcards")
-    
-    s_byte(0x82, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0005, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Potentially invalid wildcard patterns
-        s_word(0x0020, name="topic_len", endian=">", fuzzable=True)
-        s_string("sport/+/+/#/invalid/+/#", name="topic", fuzzable=True)
-        s_byte(0x02, name="qos", fuzzable=True)
-    
-    session.connect(s_get("sub_wildcards"))
+def define_mqtt_subscribe_wildcards():
+    """MQTT-SUBSCRIBE-Wildcards: Subscribe with invalid wildcard patterns."""
+    return Request("MQTT-SUBSCRIBE-Wildcards", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_SUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0005, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x0017, endian=BIG_ENDIAN, fuzzable=True),
+            # Invalid: multiple # wildcards, + adjacent to non-separator
+            String(name="topic_filter", default_value="sport/+/+/#/invalid/+/#", fuzzable=True),
+            Byte(name="requested_qos", default_value=0x02, fuzzable=True),
+        )),
+    ))
 
+
+# =============================================================================
+# Session Configuration and Main
+# =============================================================================
 
 def create_stateful_session(host, port):
-    """Create a session for stateful fuzzing."""
+    """Create a session for stateful fuzzing with callbacks."""
     session = Session(
         target=Target(
             connection=TCPSocketConnection(host, port),
         ),
         sleep_time=0.05,
         restart_sleep_time=0.5,
+        web_port=26001,  # Different port from basic fuzzer
+        keep_web_open=True,
+        crash_threshold_element=3,
+        crash_threshold_request=10,
         pre_send_callbacks=[pre_send_connect],
         post_test_case_callbacks=[post_test_case_callback],
     )
-    
+
     print("[*] Defining connected-state packets...")
-    define_publish_connected(session)
-    define_subscribe_connected(session)
-    define_unsubscribe_connected(session)
-    define_qos1_publish_connected(session)
-    define_qos2_publish_connected(session)
-    define_pubrel_connected(session)
-    define_pingreq_connected(session)
-    define_second_connect(session)
-    define_massive_topic(session)
-    define_subscribe_wildcards(session)
-    
+    session.connect(define_mqtt_publish_connected())
+    session.connect(define_mqtt_subscribe_connected())
+    session.connect(define_mqtt_unsubscribe_connected())
+    session.connect(define_mqtt_publish_qos1_connected())
+    session.connect(define_mqtt_publish_qos2_connected())
+    session.connect(define_mqtt_pubrel_connected())
+    session.connect(define_mqtt_pingreq_connected())
+    session.connect(define_mqtt_second_connect())
+    session.connect(define_mqtt_massive_topic())
+    session.connect(define_mqtt_subscribe_wildcards())
+
     return session
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="MQTT 3.1.1 Stateful Protocol Fuzzer",
-        epilog="This version establishes a valid MQTT connection before fuzzing."
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+This version establishes a valid MQTT connection before fuzzing.
+Finds bugs that only manifest in authenticated/connected state.
+
+Examples:
+  %(prog)s -t localhost -p 1883
+  %(prog)s -t 10.0.2.2 -p 1883 -r MQTT-PUBLISH-Connected
+
+Protocol reference:
+  https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
+        """
     )
-    
-    parser.add_argument("-H", "--host", default="localhost",
+
+    parser.add_argument("-t", "--target", default="localhost",
                         help="Target MQTT broker host")
-    parser.add_argument("-P", "--port", type=int, default=1883,
+    parser.add_argument("-p", "--port", type=int, default=MQTT_PORT,
                         help="Target MQTT broker port")
     parser.add_argument("-r", "--request", type=str,
                         help="Fuzz only a specific request")
     parser.add_argument("-l", "--list", action="store_true",
                         help="List available requests")
-    
+
     args = parser.parse_args()
-    
+
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║       MQTT 3.1.1 Stateful Fuzzer (Connected State)           ║
     ║                                                              ║
+    ║  Target: {host}:{port:<5}                                    ║
+    ║  Web UI: http://localhost:26001                              ║
+    ║                                                              ║
     ║  Establishes valid MQTT connection, then fuzzes packets      ║
     ║  in the authenticated session state.                         ║
     ╚══════════════════════════════════════════════════════════════╝
-    """)
-    
-    session = create_stateful_session(args.host, args.port)
-    
+    """.format(host=args.target, port=args.port))
+
+    session = create_stateful_session(args.target, args.port)
+
     if args.list:
         print("\nAvailable requests:")
         for name in session.fuzz_node_names():
             print(f"  - {name}")
         return 0
-    
-    print(f"[*] Target: {args.host}:{args.port}")
+
+    print(f"[*] Target: {args.target}:{args.port}")
     print("[*] Press Ctrl+C to stop\n")
-    
+
     try:
         if args.request:
             session.fuzz(name=args.request)
@@ -423,7 +463,7 @@ def main():
             session.fuzz()
     except KeyboardInterrupt:
         print("\n[!] Interrupted")
-    
+
     return 0
 
 

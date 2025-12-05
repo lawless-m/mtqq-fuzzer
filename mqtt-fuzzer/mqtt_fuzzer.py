@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-MQTT 3.1.1 Protocol Fuzzer for boofuzz
+MQTT 3.1.1 Protocol Fuzzer
 
 A comprehensive fuzzer for MQTT brokers implementing the OASIS MQTT 3.1.1 specification.
 Designed for security testing of brokers like Mosquitto, NanoMQ, EMQX, etc.
 
 Protocol reference: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
-
-Author: Built with boofuzz
-License: MIT
 """
 
 from boofuzz import (
@@ -20,34 +17,20 @@ from boofuzz import (
     Byte,
     Bytes,
     Word,
-    DWord,
     String,
     Static,
-    Size,
-    Checksum,
-    BitField,
-    Group,
-    s_initialize,
-    s_block,
-    s_byte,
-    s_bytes,
-    s_word,
-    s_dword,
-    s_string,
-    s_static,
-    s_size,
-    s_bit_field,
-    s_group,
     s_get,
+    BIG_ENDIAN,
 )
-import struct
 import argparse
 import sys
 
 
 # =============================================================================
-# MQTT 3.1.1 Constants
+# MQTT 3.1.1 Constants (per OASIS specification)
 # =============================================================================
+
+MQTT_PORT = 1883
 
 # Control Packet Types (upper 4 bits of first byte)
 MQTT_CONNECT     = 0x10  # 1 << 4
@@ -71,590 +54,446 @@ MQTT_PROTOCOL_LEVEL = 0x04  # Version 3.1.1
 
 
 # =============================================================================
-# Helper: Variable Length Encoding
+# MQTT Protocol Definitions (Object-Oriented Style)
 # =============================================================================
 
-def encode_remaining_length(length):
+def define_mqtt_connect():
     """
-    Encode remaining length per MQTT spec.
-    Uses continuation bit (MSB) to indicate more bytes follow.
+    MQTT-CONNECT: Client requests connection to Server.
+    Per MQTT 3.1.1 Section 3.1.
     """
-    encoded = bytearray()
-    while True:
-        digit = length % 128
-        length = length // 128
-        if length > 0:
-            digit |= 0x80
-        encoded.append(digit)
-        if length == 0:
-            break
-    return bytes(encoded)
+    return Request("MQTT-CONNECT", children=(
+        # Fixed Header
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        # Variable Header
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            Static(name="protocol_name", default_value=MQTT_PROTOCOL_NAME),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            Byte(name="connect_flags", default_value=0x02, fuzzable=True),  # Clean Session
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        # Payload
+        Block("Payload", children=(
+            Word(name="client_id_length", default_value=0x0007, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="client_id", default_value="fuzzer1", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def encode_utf8_string(s):
+def define_mqtt_connect_full():
     """
-    Encode a string as MQTT UTF-8 string (2-byte length prefix + data).
+    MQTT-CONNECT-Full: Connection with all optional fields.
+    Tests Username, Password, and Will message parsing.
     """
-    if isinstance(s, str):
-        s = s.encode('utf-8')
-    return struct.pack(">H", len(s)) + s
+    return Request("MQTT-CONNECT-Full", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            Static(name="protocol_name", default_value=MQTT_PROTOCOL_NAME),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            # Flags: Username(1) + Password(1) + Will Retain(1) + Will QoS 2(10) + Will(1) + Clean(1)
+            Byte(name="connect_flags", default_value=0xF6, fuzzable=True),
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            # Client ID
+            Word(name="client_id_length", default_value=0x0008, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="client_id", default_value="fuzzfull", fuzzable=True, max_len=65535),
+            # Will Topic
+            Word(name="will_topic_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="will_topic", default_value="will/topic", fuzzable=True, max_len=65535),
+            # Will Message
+            Word(name="will_message_length", default_value=0x000C, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="will_message", default_value="will message", fuzzable=True, max_len=65535),
+            # Username
+            Word(name="username_length", default_value=0x0008, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="username", default_value="testuser", fuzzable=True, max_len=65535),
+            # Password
+            Word(name="password_length", default_value=0x0008, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="password", default_value="testpass", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-# =============================================================================
-# Custom Encoder for Remaining Length
-# =============================================================================
-
-class MQTTRemainingLengthEncoder:
+def define_mqtt_publish_qos0():
     """
-    Custom encoder to produce MQTT variable-length encoding for the 
-    Remaining Length field.
+    MQTT-PUBLISH-QoS0: Publish with at-most-once delivery.
+    Per MQTT 3.1.1 Section 3.3.
     """
-    @staticmethod
-    def encode(length_bytes):
-        """Convert a length value to MQTT remaining length encoding."""
-        if isinstance(length_bytes, bytes):
-            length = int.from_bytes(length_bytes, 'big')
-        else:
-            length = int(length_bytes)
-        return encode_remaining_length(length)
-
-
-# =============================================================================
-# MQTT Protocol Definitions
-# =============================================================================
-
-def define_connect(session):
-    """
-    CONNECT Packet - Client requests connection to Server
-    
-    Fixed Header:
-        - Byte 1: Packet type (0x10) + Reserved (0x00)
-        - Bytes 2+: Remaining Length (variable)
-    
-    Variable Header:
-        - Protocol Name: UTF-8 "MQTT"
-        - Protocol Level: 0x04 (v3.1.1)
-        - Connect Flags: Clean Session, Will, Will QoS, Will Retain, Password, Username
-        - Keep Alive: 2 bytes
-    
-    Payload:
-        - Client Identifier (required)
-        - Will Topic (if Will Flag set)
-        - Will Message (if Will Flag set)
-        - Username (if Username Flag set)
-        - Password (if Password Flag set)
-    """
-    s_initialize("connect")
-    
-    # Fixed Header - Packet Type
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    
-    # We'll manually construct remaining length after the variable header + payload
-    # For fuzzing, we include it as a fuzzable field
-    with s_block("remaining_length"):
-        # Remaining length - typically small for CONNECT, but let's fuzz it
-        # Using a byte that can be fuzzed to test length parsing
-        s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        # Protocol Name Length (2 bytes, big-endian)
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        
-        # Protocol Name "MQTT"
-        s_static(b"MQTT", name="protocol_name")
-        
-        # Protocol Level (0x04 for v3.1.1)
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        
-        # Connect Flags
-        # Bit 7: Username Flag
-        # Bit 6: Password Flag  
-        # Bit 5: Will Retain
-        # Bits 4-3: Will QoS (0, 1, 2)
-        # Bit 2: Will Flag
-        # Bit 1: Clean Session
-        # Bit 0: Reserved (must be 0)
-        s_byte(0x02, name="connect_flags", fuzzable=True)  # Clean Session only
-        
-        # Keep Alive (seconds)
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Client Identifier (UTF-8 encoded string)
-        s_word(0x0007, name="client_id_len", endian=">", fuzzable=True)
-        s_string("fuzzer1", name="client_id", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("connect"))
+    return Request("MQTT-PUBLISH-QoS0", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBLISH, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="test/topic", fuzzable=True, max_len=65535),
+            # No Packet Identifier for QoS 0
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="Hello MQTT", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_connect_full(session):
+def define_mqtt_publish_qos1():
     """
-    CONNECT Packet with all optional fields - Username, Password, Will
-    
-    This tests the more complex parsing paths in brokers.
+    MQTT-PUBLISH-QoS1: Publish with at-least-once delivery.
+    Includes Packet Identifier, expects PUBACK.
     """
-    s_initialize("connect_full")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    
-    # Remaining length - we'll use a larger value for full connect
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        s_static(b"MQTT", name="protocol_name")
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        
-        # Connect Flags with all features enabled
-        # 0xF6 = Username(1) + Password(1) + Will Retain(1) + Will QoS 2(10) + Will(1) + Clean Session(1) + Reserved(0)
-        # Actually: 11110110 = 0xF6
-        s_byte(0xF6, name="connect_flags", fuzzable=True)
-        
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Client ID
-        s_word(0x0008, name="client_id_len", endian=">", fuzzable=True)
-        s_string("fuzzfull", name="client_id", fuzzable=True, max_len=65535)
-        
-        # Will Topic (because Will Flag is set)
-        s_word(0x000A, name="will_topic_len", endian=">", fuzzable=True)
-        s_string("will/topic", name="will_topic", fuzzable=True, max_len=65535)
-        
-        # Will Message
-        s_word(0x000C, name="will_message_len", endian=">", fuzzable=True)
-        s_string("will message", name="will_message", fuzzable=True, max_len=65535)
-        
-        # Username
-        s_word(0x0008, name="username_len", endian=">", fuzzable=True)
-        s_string("testuser", name="username", fuzzable=True, max_len=65535)
-        
-        # Password
-        s_word(0x0008, name="password_len", endian=">", fuzzable=True)
-        s_string("testpass", name="password", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("connect_full"))
+    return Request("MQTT-PUBLISH-QoS1", children=(
+        Block("Fixed-Header", children=(
+            # PUBLISH + QoS 1 (0x32 = 0x30 | 0x02)
+            Byte(name="packet_type", default_value=0x32, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x000B, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="test/topic1", fuzzable=True, max_len=65535),
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="QoS 1 Message", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_publish_qos0(session):
+def define_mqtt_publish_qos2():
     """
-    PUBLISH Packet - QoS 0 (at most once, fire and forget)
-    
-    Fixed Header:
-        - Byte 1: Packet type (0x30) + DUP(0) + QoS(00) + RETAIN(0)
-        - Bytes 2+: Remaining Length
-    
-    Variable Header:
-        - Topic Name (UTF-8 string)
-        - No Packet Identifier for QoS 0
-    
-    Payload:
-        - Application Message (arbitrary bytes)
+    MQTT-PUBLISH-QoS2: Publish with exactly-once delivery.
+    Initiates 4-way handshake (PUBLISH -> PUBREC -> PUBREL -> PUBCOMP).
     """
-    s_initialize("publish_qos0")
-    
-    # Fixed header: PUBLISH (3 << 4) + flags
-    # Bits 3: DUP, Bits 2-1: QoS, Bit 0: RETAIN
-    s_byte(0x30, name="packet_type", fuzzable=True)
-    
-    # Remaining length
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        # Topic Name
-        s_word(0x000A, name="topic_len", endian=">", fuzzable=True)
-        s_string("test/topic", name="topic", fuzzable=True, max_len=65535)
-    
-    with s_block("payload"):
-        # Application Message
-        s_string("Hello MQTT", name="message", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("publish_qos0"))
+    return Request("MQTT-PUBLISH-QoS2", children=(
+        Block("Fixed-Header", children=(
+            # PUBLISH + QoS 2 (0x34 = 0x30 | 0x04)
+            Byte(name="packet_type", default_value=0x34, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0x000B, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_name", default_value="test/topic2", fuzzable=True, max_len=65535),
+            Word(name="packet_identifier", default_value=0x0002, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            String(name="application_message", default_value="QoS 2 Message", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_publish_qos1(session):
+def define_mqtt_subscribe():
     """
-    PUBLISH Packet - QoS 1 (at least once, requires PUBACK)
-    
-    Includes Packet Identifier in variable header.
+    MQTT-SUBSCRIBE: Client subscribes to topic filters.
+    Per MQTT 3.1.1 Section 3.8.
     """
-    s_initialize("publish_qos1")
-    
-    # PUBLISH + QoS 1 (0x32 = 0x30 | 0x02)
-    s_byte(0x32, name="packet_type", fuzzable=True)
-    
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x000B, name="topic_len", endian=">", fuzzable=True)
-        s_string("test/topic1", name="topic", fuzzable=True, max_len=65535)
-        
-        # Packet Identifier (required for QoS > 0)
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_string("QoS 1 Message", name="message", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("publish_qos1"))
+    return Request("MQTT-SUBSCRIBE", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_SUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_filter", default_value="test/topic", fuzzable=True, max_len=65535),
+            Byte(name="requested_qos", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_publish_qos2(session):
+def define_mqtt_subscribe_multi():
     """
-    PUBLISH Packet - QoS 2 (exactly once, full handshake)
+    MQTT-SUBSCRIBE-Multi: Subscribe to multiple topic filters.
+    Tests list parsing in subscription handler.
     """
-    s_initialize("publish_qos2")
-    
-    # PUBLISH + QoS 2 (0x34 = 0x30 | 0x04)
-    s_byte(0x34, name="packet_type", fuzzable=True)
-    
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x000B, name="topic_len", endian=">", fuzzable=True)
-        s_string("test/topic2", name="topic", fuzzable=True, max_len=65535)
-        
-        s_word(0x0002, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_string("QoS 2 Message", name="message", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("publish_qos2"))
+    return Request("MQTT-SUBSCRIBE-Multi", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_SUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0002, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            # Topic Filter 1
+            Word(name="topic1_length", default_value=0x0007, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic1", default_value="topic/1", fuzzable=True, max_len=65535),
+            Byte(name="qos1", default_value=0x00, fuzzable=True),
+            # Topic Filter 2
+            Word(name="topic2_length", default_value=0x0007, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic2", default_value="topic/2", fuzzable=True, max_len=65535),
+            Byte(name="qos2", default_value=0x01, fuzzable=True),
+            # Topic Filter 3 (with wildcard)
+            Word(name="topic3_length", default_value=0x0008, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic3", default_value="topic/#", fuzzable=True, max_len=65535),
+            Byte(name="qos3", default_value=0x02, fuzzable=True),
+        )),
+    ))
 
 
-def define_subscribe(session):
+def define_mqtt_unsubscribe():
     """
-    SUBSCRIBE Packet - Client subscribes to topics
-    
-    Fixed Header:
-        - Byte 1: 0x82 (SUBSCRIBE + reserved bits must be 0010)
-        - Bytes 2+: Remaining Length
-    
-    Variable Header:
-        - Packet Identifier (2 bytes)
-    
-    Payload:
-        - List of (Topic Filter, Requested QoS) pairs
+    MQTT-UNSUBSCRIBE: Client unsubscribes from topic filters.
+    Per MQTT 3.1.1 Section 3.10.
     """
-    s_initialize("subscribe")
-    
-    # SUBSCRIBE packet type with required flags (0x82)
-    s_byte(0x82, name="packet_type", fuzzable=True)
-    
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        # Packet Identifier
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Topic Filter 1
-        s_word(0x000A, name="topic_filter_len", endian=">", fuzzable=True)
-        s_string("test/topic", name="topic_filter", fuzzable=True, max_len=65535)
-        
-        # Requested QoS (only bits 0-1 used, rest reserved)
-        s_byte(0x00, name="requested_qos", fuzzable=True)
-    
-    session.connect(s_get("subscribe"))
+    return Request("MQTT-UNSUBSCRIBE", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_UNSUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x000A, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="topic_filter", default_value="test/topic", fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_subscribe_multi(session):
+def define_mqtt_pingreq():
     """
-    SUBSCRIBE with multiple topic filters - tests list parsing
+    MQTT-PINGREQ: Client ping to keep connection alive.
+    Per MQTT 3.1.1 Section 3.12.
     """
-    s_initialize("subscribe_multi")
-    
-    s_byte(0x82, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0002, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Topic Filter 1
-        s_word(0x0007, name="topic1_len", endian=">", fuzzable=True)
-        s_string("topic/1", name="topic1", fuzzable=True, max_len=65535)
-        s_byte(0x00, name="qos1", fuzzable=True)
-        
-        # Topic Filter 2
-        s_word(0x0007, name="topic2_len", endian=">", fuzzable=True)
-        s_string("topic/2", name="topic2", fuzzable=True, max_len=65535)
-        s_byte(0x01, name="qos2", fuzzable=True)
-        
-        # Topic Filter 3 (with wildcard)
-        s_word(0x0008, name="topic3_len", endian=">", fuzzable=True)
-        s_string("topic/#", name="topic3", fuzzable=True, max_len=65535)
-        s_byte(0x02, name="qos3", fuzzable=True)
-    
-    session.connect(s_get("subscribe_multi"))
+    return Request("MQTT-PINGREQ", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PINGREQ, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_unsubscribe(session):
+def define_mqtt_disconnect():
     """
-    UNSUBSCRIBE Packet - Client unsubscribes from topics
+    MQTT-DISCONNECT: Client graceful disconnect.
+    Per MQTT 3.1.1 Section 3.14.
     """
-    s_initialize("unsubscribe")
-    
-    # UNSUBSCRIBE packet type with required flags (0xA2)
-    s_byte(0xA2, name="packet_type", fuzzable=True)
-    
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_word(0x000A, name="topic_len", endian=">", fuzzable=True)
-        s_string("test/topic", name="topic", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("unsubscribe"))
+    return Request("MQTT-DISCONNECT", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_DISCONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_pingreq(session):
+def define_mqtt_puback():
     """
-    PINGREQ Packet - Client ping to keep connection alive
-    
-    Minimal packet: just type + remaining length of 0
+    MQTT-PUBACK: Acknowledgment for QoS 1 PUBLISH.
+    Per MQTT 3.1.1 Section 3.4.
     """
-    s_initialize("pingreq")
-    
-    s_byte(0xC0, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    session.connect(s_get("pingreq"))
+    return Request("MQTT-PUBACK", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBACK, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x02, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
-def define_disconnect(session):
+def define_mqtt_pubrec():
     """
-    DISCONNECT Packet - Client graceful disconnect
+    MQTT-PUBREC: Part of QoS 2 handshake.
+    Per MQTT 3.1.1 Section 3.5.
     """
-    s_initialize("disconnect")
-    
-    s_byte(0xE0, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    session.connect(s_get("disconnect"))
+    return Request("MQTT-PUBREC", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBREC, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x02, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
-def define_puback(session):
+def define_mqtt_pubrel():
     """
-    PUBACK Packet - Acknowledgment for QoS 1 PUBLISH
-    
-    Normally sent by server, but let's test what happens if client sends it.
+    MQTT-PUBREL: Part of QoS 2 handshake.
+    Per MQTT 3.1.1 Section 3.6. Fixed flags MUST be 0010.
     """
-    s_initialize("puback")
-    
-    s_byte(0x40, name="packet_type", fuzzable=True)
-    s_byte(0x02, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    session.connect(s_get("puback"))
+    return Request("MQTT-PUBREL", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBREL, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x02, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
-def define_pubrec(session):
+def define_mqtt_pubcomp():
     """
-    PUBREC Packet - Part of QoS 2 handshake
+    MQTT-PUBCOMP: Final part of QoS 2 handshake.
+    Per MQTT 3.1.1 Section 3.7.
     """
-    s_initialize("pubrec")
-    
-    s_byte(0x50, name="packet_type", fuzzable=True)
-    s_byte(0x02, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    session.connect(s_get("pubrec"))
-
-
-def define_pubrel(session):
-    """
-    PUBREL Packet - Part of QoS 2 handshake
-    
-    Note: Fixed header flags MUST be 0010 (0x02)
-    """
-    s_initialize("pubrel")
-    
-    s_byte(0x62, name="packet_type", fuzzable=True)  # 0x60 | 0x02
-    s_byte(0x02, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    session.connect(s_get("pubrel"))
-
-
-def define_pubcomp(session):
-    """
-    PUBCOMP Packet - Final part of QoS 2 handshake
-    """
-    s_initialize("pubcomp")
-    
-    s_byte(0x70, name="packet_type", fuzzable=True)
-    s_byte(0x02, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0001, name="packet_id", endian=">", fuzzable=True)
-    
-    session.connect(s_get("pubcomp"))
+    return Request("MQTT-PUBCOMP", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBCOMP, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x02, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0001, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
 # =============================================================================
 # Edge Case / Malformed Packet Definitions
 # =============================================================================
 
-def define_malformed_remaining_length(session):
+def define_mqtt_malformed_remaining_length():
     """
-    Test remaining length edge cases:
-    - Maximum value (268,435,455)
-    - Invalid continuation bytes
-    - Truncated encoding
+    MQTT-Malformed-RemainingLength: Test remaining length edge cases.
+    Invalid continuation bytes, maximum values, truncated encoding.
     """
-    s_initialize("malformed_remaining_length")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    
-    # Fuzz the remaining length bytes directly
-    # Valid: 1-4 bytes with continuation bits
-    # Let's send potentially invalid encodings
-    s_bytes(b"\xFF\xFF\xFF\x7F", name="remaining_len", fuzzable=True, max_len=8)
-    
-    session.connect(s_get("malformed_remaining_length"))
+    return Request("MQTT-Malformed-RemainingLength", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            # Maximum/invalid remaining length encoding
+            Bytes(name="remaining_length", default_value=b"\xFF\xFF\xFF\x7F", fuzzable=True, max_len=8),
+        )),
+    ))
 
 
-def define_malformed_utf8(session):
+def define_mqtt_malformed_utf8():
     """
-    Test UTF-8 string handling edge cases:
-    - Invalid UTF-8 sequences
-    - Overlong encodings
-    - Null characters
-    - Length mismatches
+    MQTT-Malformed-UTF8: Test UTF-8 string handling edge cases.
+    Invalid sequences, overlong encodings, null characters.
     """
-    s_initialize("malformed_utf8")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    s_byte(0x20, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        # Potentially invalid UTF-8
-        s_bytes(b"\xFF\xFE\x00\x00", name="protocol_name", fuzzable=True, max_len=256)
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        s_byte(0x02, name="connect_flags", fuzzable=True)
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Client ID with invalid UTF-8
-        s_word(0x0010, name="client_id_len", endian=">", fuzzable=True)
-        s_bytes(b"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F",
-                name="client_id", fuzzable=True, max_len=65535)
-    
-    session.connect(s_get("malformed_utf8"))
+    return Request("MQTT-Malformed-UTF8", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x20, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            # Invalid UTF-8 bytes
+            Bytes(name="protocol_name", default_value=b"\xFF\xFE\x00\x00", fuzzable=True, max_len=256),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            Byte(name="connect_flags", default_value=0x02, fuzzable=True),
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="client_id_length", default_value=0x0010, endian=BIG_ENDIAN, fuzzable=True),
+            # Invalid UTF-8 continuation bytes
+            Bytes(name="client_id",
+                  default_value=b"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F",
+                  fuzzable=True, max_len=65535),
+        )),
+    ))
 
 
-def define_topic_wildcards(session):
+def define_mqtt_topic_wildcards():
     """
-    Test topic wildcard handling:
-    - Single-level wildcard (+)
-    - Multi-level wildcard (#)
-    - Invalid wildcard positions
-    - Mixed wildcards
+    MQTT-Topic-Wildcards: Test wildcard handling edge cases.
+    Invalid wildcard positions, mixed wildcards.
     """
-    s_initialize("topic_wildcards")
-    
-    s_byte(0x82, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0003, name="packet_id", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Various wildcard patterns
-        s_word(0x0010, name="topic_len", endian=">", fuzzable=True)
-        s_string("test/+/data/#/bad", name="topic", fuzzable=True, max_len=65535)
-        s_byte(0x00, name="qos", fuzzable=True)
-    
-    session.connect(s_get("topic_wildcards"))
+    return Request("MQTT-Topic-Wildcards", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_SUBSCRIBE, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="packet_identifier", default_value=0x0003, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="topic_filter_length", default_value=0x0011, endian=BIG_ENDIAN, fuzzable=True),
+            # Invalid: # must be last, + cannot be adjacent to non-separator
+            String(name="topic_filter", default_value="test/+/data/#/bad", fuzzable=True, max_len=65535),
+            Byte(name="requested_qos", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_zero_length_fields(session):
+def define_mqtt_zero_length():
     """
-    Test zero-length strings and fields
+    MQTT-Zero-Length: Test zero-length strings and fields.
     """
-    s_initialize("zero_length")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    s_byte(0x0C, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        s_static(b"MQTT", name="protocol_name")
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        s_byte(0x02, name="connect_flags", fuzzable=True)
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        # Zero-length client ID (allowed with Clean Session)
-        s_word(0x0000, name="client_id_len", endian=">", fuzzable=True)
-    
-    session.connect(s_get("zero_length"))
+    return Request("MQTT-Zero-Length", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x0C, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            Static(name="protocol_name", default_value=MQTT_PROTOCOL_NAME),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            Byte(name="connect_flags", default_value=0x02, fuzzable=True),
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            # Zero-length client ID (allowed with Clean Session)
+            Word(name="client_id_length", default_value=0x0000, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+    ))
 
 
-def define_oversized_packet(session):
+def define_mqtt_oversized():
     """
-    Test maximum packet size handling
+    MQTT-Oversized: Test maximum packet size handling.
     """
-    s_initialize("oversized")
-    
-    s_byte(0x30, name="packet_type", fuzzable=True)
-    
-    # Maximum remaining length encoding
-    s_bytes(b"\xFF\xFF\xFF\x7F", name="remaining_len", fuzzable=True, max_len=4)
-    
-    with s_block("variable_header"):
-        s_word(0xFFFF, name="topic_len", endian=">", fuzzable=True)
-        s_bytes(b"A" * 1000, name="topic", fuzzable=True, max_len=65535)
-    
-    with s_block("payload"):
-        s_bytes(b"B" * 10000, name="message", fuzzable=True, max_len=100000)
-    
-    session.connect(s_get("oversized"))
+    return Request("MQTT-Oversized", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_PUBLISH, fuzzable=True),
+            # Maximum remaining length encoding
+            Bytes(name="remaining_length", default_value=b"\xFF\xFF\xFF\x7F", fuzzable=True, max_len=4),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="topic_length", default_value=0xFFFF, endian=BIG_ENDIAN, fuzzable=True),
+            Bytes(name="topic_name", default_value=b"A" * 1000, fuzzable=True, max_len=65535),
+        )),
+        Block("Payload", children=(
+            Bytes(name="application_message", default_value=b"B" * 10000, fuzzable=True, max_len=100000),
+        )),
+    ))
 
 
-def define_invalid_packet_type(session):
+def define_mqtt_invalid_type():
     """
-    Test invalid/reserved packet types
+    MQTT-Invalid-Type: Test reserved/invalid packet types.
+    Packet types 0 and 15 are reserved.
     """
-    s_initialize("invalid_type")
-    
-    # Packet type 0 and 15 are reserved
-    s_byte(0x00, name="packet_type", fuzzable=True)
-    s_byte(0x00, name="remaining_len", fuzzable=True)
-    
-    session.connect(s_get("invalid_type"))
+    return Request("MQTT-Invalid-Type", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=0x00, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x00, fuzzable=True),
+        )),
+    ))
 
 
-def define_duplicate_connect(session):
+def define_mqtt_duplicate_connect():
     """
-    Send CONNECT after already connected - protocol violation
+    MQTT-Duplicate-CONNECT: Send CONNECT after already connected.
+    Protocol violation per MQTT 3.1.1 Section 3.1.
     """
-    s_initialize("duplicate_connect")
-    
-    s_byte(0x10, name="packet_type", fuzzable=True)
-    s_byte(0x10, name="remaining_len", fuzzable=True)
-    
-    with s_block("variable_header"):
-        s_word(0x0004, name="protocol_name_len", endian=">", fuzzable=True)
-        s_static(b"MQTT", name="protocol_name")
-        s_byte(0x04, name="protocol_level", fuzzable=True)
-        s_byte(0x02, name="connect_flags", fuzzable=True)
-        s_word(60, name="keep_alive", endian=">", fuzzable=True)
-    
-    with s_block("payload"):
-        s_word(0x0004, name="client_id_len", endian=">", fuzzable=True)
-        s_string("dup1", name="client_id", fuzzable=True)
-    
-    session.connect(s_get("duplicate_connect"))
+    return Request("MQTT-Duplicate-CONNECT", children=(
+        Block("Fixed-Header", children=(
+            Byte(name="packet_type", default_value=MQTT_CONNECT, fuzzable=True),
+            Byte(name="remaining_length", default_value=0x10, fuzzable=True),
+        )),
+        Block("Variable-Header", children=(
+            Word(name="protocol_name_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            Static(name="protocol_name", default_value=MQTT_PROTOCOL_NAME),
+            Byte(name="protocol_level", default_value=MQTT_PROTOCOL_LEVEL, fuzzable=True),
+            Byte(name="connect_flags", default_value=0x02, fuzzable=True),
+            Word(name="keep_alive", default_value=60, endian=BIG_ENDIAN, fuzzable=True),
+        )),
+        Block("Payload", children=(
+            Word(name="client_id_length", default_value=0x0004, endian=BIG_ENDIAN, fuzzable=True),
+            String(name="client_id", default_value="dup1", fuzzable=True),
+        )),
+    ))
 
 
 # =============================================================================
@@ -669,47 +508,49 @@ def create_session(host, port, fuzz_all=False):
         target=Target(
             connection=TCPSocketConnection(host, port),
         ),
-        sleep_time=0.1,  # Small delay between test cases
+        sleep_time=0.1,
         restart_sleep_time=0.5,
-        # crash_threshold_request=10,  # Stop after 10 crashes on same request
-        # crash_threshold_element=3,   # Stop after 3 crashes on same element
+        web_port=26000,
+        keep_web_open=True,
+        crash_threshold_element=3,
+        crash_threshold_request=10,
     )
-    
+
     # Core protocol packets
     print("[*] Defining CONNECT packets...")
-    define_connect(session)
-    define_connect_full(session)
-    
+    session.connect(define_mqtt_connect())
+    session.connect(define_mqtt_connect_full())
+
     print("[*] Defining PUBLISH packets...")
-    define_publish_qos0(session)
-    define_publish_qos1(session)
-    define_publish_qos2(session)
-    
+    session.connect(define_mqtt_publish_qos0())
+    session.connect(define_mqtt_publish_qos1())
+    session.connect(define_mqtt_publish_qos2())
+
     print("[*] Defining SUBSCRIBE/UNSUBSCRIBE packets...")
-    define_subscribe(session)
-    define_subscribe_multi(session)
-    define_unsubscribe(session)
-    
+    session.connect(define_mqtt_subscribe())
+    session.connect(define_mqtt_subscribe_multi())
+    session.connect(define_mqtt_unsubscribe())
+
     print("[*] Defining control packets...")
-    define_pingreq(session)
-    define_disconnect(session)
-    
+    session.connect(define_mqtt_pingreq())
+    session.connect(define_mqtt_disconnect())
+
     print("[*] Defining QoS handshake packets...")
-    define_puback(session)
-    define_pubrec(session)
-    define_pubrel(session)
-    define_pubcomp(session)
-    
+    session.connect(define_mqtt_puback())
+    session.connect(define_mqtt_pubrec())
+    session.connect(define_mqtt_pubrel())
+    session.connect(define_mqtt_pubcomp())
+
     if fuzz_all:
         print("[*] Defining edge case / malformed packets...")
-        define_malformed_remaining_length(session)
-        define_malformed_utf8(session)
-        define_topic_wildcards(session)
-        define_zero_length_fields(session)
-        define_oversized_packet(session)
-        define_invalid_packet_type(session)
-        define_duplicate_connect(session)
-    
+        session.connect(define_mqtt_malformed_remaining_length())
+        session.connect(define_mqtt_malformed_utf8())
+        session.connect(define_mqtt_topic_wildcards())
+        session.connect(define_mqtt_zero_length())
+        session.connect(define_mqtt_oversized())
+        session.connect(define_mqtt_invalid_type())
+        session.connect(define_mqtt_duplicate_connect())
+
     return session
 
 
@@ -719,21 +560,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -H localhost -P 1883
-  %(prog)s -H 192.168.1.100 -P 1883 --all
-  %(prog)s -H localhost -P 1883 --request connect
+  %(prog)s -t localhost -p 1883
+  %(prog)s -t 192.168.1.100 -p 1883 --all
+  %(prog)s -t localhost -p 1883 -r MQTT-CONNECT
 
 Recommended test setup:
   docker run -it --rm -p 1883:1883 eclipse-mosquitto:latest
-  
+
 Or with AddressSanitizer:
-  docker run -it --rm -p 1883:1883 mosquitto-asan:latest
+  docker build -f Dockerfile.mosquitto-asan -t mosquitto-asan .
+  docker run -it --rm -p 1883:1883 mosquitto-asan
         """
     )
-    
-    parser.add_argument("-H", "--host", default="localhost",
+
+    parser.add_argument("-t", "--target", default="localhost",
                         help="Target MQTT broker host (default: localhost)")
-    parser.add_argument("-P", "--port", type=int, default=1883,
+    parser.add_argument("-p", "--port", type=int, default=MQTT_PORT,
                         help="Target MQTT broker port (default: 1883)")
     parser.add_argument("-a", "--all", action="store_true",
                         help="Include malformed/edge case packet definitions")
@@ -741,29 +583,29 @@ Or with AddressSanitizer:
                         help="Fuzz only a specific request by name")
     parser.add_argument("-l", "--list", action="store_true",
                         help="List available request names and exit")
-    
+
     args = parser.parse_args()
-    
+
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║           MQTT 3.1.1 Protocol Fuzzer for boofuzz             ║
     ║                                                              ║
-    ║  Target: {host}:{port}                                  
-    ║  The S in IoT stands for Security                            ║
+    ║  Target: {host}:{port:<5}                                    ║
+    ║  Web UI: http://localhost:26000                              ║
     ╚══════════════════════════════════════════════════════════════╝
-    """.format(host=args.host, port=args.port))
-    
-    session = create_session(args.host, args.port, fuzz_all=args.all)
-    
+    """.format(host=args.target, port=args.port))
+
+    session = create_session(args.target, args.port, fuzz_all=args.all)
+
     if args.list:
         print("\nAvailable requests:")
         for name in session.fuzz_node_names():
             print(f"  - {name}")
         return 0
-    
-    print(f"\n[*] Starting fuzzer against {args.host}:{args.port}")
+
+    print(f"\n[*] Starting fuzzer against {args.target}:{args.port}")
     print("[*] Press Ctrl+C to stop\n")
-    
+
     try:
         if args.request:
             session.fuzz(name=args.request)
@@ -774,7 +616,7 @@ Or with AddressSanitizer:
     except Exception as e:
         print(f"\n[!] Error: {e}")
         return 1
-    
+
     print("\n[*] Fuzzing complete!")
     return 0
 
