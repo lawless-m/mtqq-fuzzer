@@ -1,0 +1,22 @@
+[Unit]
+Description=MQTT Protocol Fuzzing Campaign
+After=network.target qemu-fuzzing-vm.service
+Requires=qemu-fuzzing-vm.service
+
+[Service]
+Type=simple
+User=matt
+WorkingDirectory=/home/matt/Git/mtqq-fuzzer
+ExecStart=/home/matt/Git/mtqq-fuzzer/run_fuzzing_campaign.sh
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment="VM_SSH_PORT=2227"
+Environment="VM_USER=debian"
+Environment="VM_HOST=localhost"
+Environment="MQTT_PORT=1883"
+
+[Install]
+WantedBy=multi-user.target

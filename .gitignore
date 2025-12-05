@@ -1,0 +1,14 @@
+# Fuzzing results and logs (can be large)
+logs/
+boofuzz-results/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.log
+*.out
+nohup.out
