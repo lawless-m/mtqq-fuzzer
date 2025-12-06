@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  emqx:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.emqx
+    container_name: emqx-fuzzing-target
+    ports:
+      - "1883:1883"
+      - "18083:18083"  # Dashboard (optional)
+    volumes:
+      - ./logs:/logs
+    networks:
+      - fuzzing-net
+    restart: unless-stopped
+    # ASAN needs more resources
+    mem_limit: 4g
+    shm_size: 2g
+    environment:
+      - ASAN_OPTIONS=detect_leaks=1:abort_on_error=0:halt_on_error=0:print_stats=1:log_path=/logs/asan
+
+  fuzzer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.fuzzer
+    container_name: mqtt-fuzzer
+    depends_on:
+      - emqx
+    volumes:
+      - ./results:/fuzzer/results
+      - ./logs:/fuzzer/logs
+      - ../mqtt_fuzzer.py:/fuzzer/mqtt_fuzzer.py:ro
+    networks:
+      - fuzzing-net
+    # Wait for EMQX to start
+    command: >
+      sh -c "
+        echo 'Waiting for EMQX to be ready...' &&
+        sleep 10 &&
+        while ! nc -z emqx 1883; do sleep 1; done &&
+        echo 'EMQX is ready, starting fuzzer...' &&
+        python3 mqtt_fuzzer.py -t emqx -p 1883
+      "
+
+networks:
+  fuzzing-net:
+    driver: bridge

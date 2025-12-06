@@ -1,0 +1,42 @@
+# NanoMQ with AddressSanitizer for fuzzing
+FROM debian:bookworm-slim
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build NanoMQ with ASAN
+WORKDIR /build
+RUN git clone --depth 1 --branch 0.23.0 https://github.com/nanomq/nanomq.git && \
+    cd nanomq && \
+    git submodule update --init --recursive
+
+WORKDIR /build/nanomq/build
+RUN cmake .. -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+    -DNNG_ENABLE_TLS=OFF \
+    -DENABLE_JWT=OFF \
+    -DENABLE_QUIC=OFF && \
+    ninja nanomq
+
+# Create minimal config
+RUN mkdir -p /etc/nanomq && \
+    echo 'listeners.tcp {\n  bind = "0.0.0.0:1883"\n}\nmqtt {\n  max_packet_size = 1MB\n}\nlog {\n  to = [console]\n  level = error\n}' > /etc/nanomq/nanomq.conf
+
+# Set up runtime
+WORKDIR /app
+RUN cp /build/nanomq/build/nanomq/nanomq /app/
+
+# ASAN requires more memory
+ENV ASAN_OPTIONS="detect_leaks=1:abort_on_error=0:halt_on_error=0:print_stats=1:log_path=/logs/asan"
+
+EXPOSE 1883
+
+CMD ["/app/nanomq", "start", "--conf", "/etc/nanomq/nanomq.conf"]

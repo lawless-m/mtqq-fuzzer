@@ -1,0 +1,18 @@
+# Don't copy these into Docker build context
+logs/
+results/
+boofuzz-results/
+*.log
+*.db
+
+# VM-specific stuff
+*.qcow2
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Git
+.git/
+.gitignore

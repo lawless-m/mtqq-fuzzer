@@ -1,0 +1,41 @@
+# EMQX with AddressSanitizer for fuzzing C NIFs
+FROM erlang:26-slim
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libssl-dev \
+    libncurses-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone EMQX
+WORKDIR /build
+RUN git clone --depth 1 --branch v5.8.3 https://github.com/emqx/emqx.git
+
+WORKDIR /build/emqx
+
+# Build with ASAN for C NIFs
+# EMQX uses rebar3 which compiles C code
+ENV CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1"
+ENV LDFLAGS="-fsanitize=address"
+ENV ASAN_OPTIONS="detect_leaks=1:abort_on_error=0:halt_on_error=0:print_stats=1:log_path=/logs/asan"
+
+# Build EMQX
+RUN make
+
+# Create minimal config
+RUN mkdir -p /opt/emqx/etc && \
+    echo 'listeners.tcp.default {\n  bind = "0.0.0.0:1883"\n  max_connections = 1024000\n}\nlog {\n  console_handler {\n    enable = true\n    level = error\n  }\n}' > /opt/emqx/etc/emqx.conf
+
+# Copy built release
+RUN cp -r _build/emqx/rel/emqx /opt/
+
+WORKDIR /opt/emqx
+
+EXPOSE 1883
+
+# Start EMQX in foreground
+CMD ["./bin/emqx", "foreground"]

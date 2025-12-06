@@ -1,0 +1,22 @@
+# MQTT Fuzzer container
+FROM python:3.11-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    netcat-openbsd \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /fuzzer
+
+# Install Python dependencies
+RUN pip install --no-cache-dir boofuzz
+
+# Copy fuzzer script
+COPY mqtt_fuzzer.py /fuzzer/
+
+# Create directories for results
+RUN mkdir -p /fuzzer/results /fuzzer/logs
+
+# Default command
+CMD ["python3", "mqtt_fuzzer.py", "-t", "nanomq", "-p", "1883"]
