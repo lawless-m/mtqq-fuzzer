@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libncurses-dev \
     curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone EMQX
